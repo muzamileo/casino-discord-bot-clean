@@ -7,7 +7,7 @@ import random
 import os
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -23,68 +23,113 @@ async def on_ready():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                balance INTEGER,
+                cash INTEGER DEFAULT 0,
+                bank INTEGER DEFAULT 0,
                 last_daily TEXT
             )
         """)
         await db.commit()
     print(f'Logged in as {bot.user}!')
 
+# Ensure user exists
+async def ensure_user(db, user_id):
+    cursor = await db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    row = await cursor.fetchone()
+    if row is None:
+        await db.execute("INSERT INTO users (user_id, cash, bank, last_daily) VALUES (?, ?, ?, ?)", (user_id, 1000, 0, None))
+        await db.commit()
+
 # Balance command
 @bot.command()
 async def balance(ctx):
     async with aiosqlite.connect("casino.db") as db:
-        cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (ctx.author.id,))
-        row = await cursor.fetchone()
-        if row is None:
-            await db.execute("INSERT INTO users (user_id, balance, last_daily) VALUES (?, ?, ?)", (ctx.author.id, 1000, None))
-            await db.commit()
-            balance = 1000
-        else:
-            balance = row[0]
-        await ctx.send(f"{ctx.author.mention} Your balance is {balance} coins!")
+        await ensure_user(db, ctx.author.id)
+        cursor = await db.execute("SELECT cash, bank FROM users WHERE user_id = ?", (ctx.author.id,))
+        cash, bank = await cursor.fetchone()
+        total = cash + bank
+        await ctx.send(f"{ctx.author.mention} | 💰 Cash: {cash} | 🏦 Bank: {bank} | 🧮 Total: {total}")
 
-# Daily reward command
+# Deposit command
+@bot.command()
+async def deposit(ctx, amount: int):
+    if amount <= 0:
+        await ctx.send("You can't deposit 0 or negative!")
+        return
+
+    async with aiosqlite.connect("casino.db") as db:
+        await ensure_user(db, ctx.author.id)
+        cursor = await db.execute("SELECT cash, bank FROM users WHERE user_id = ?", (ctx.author.id,))
+        cash, bank = await cursor.fetchone()
+
+        if amount > cash:
+            await ctx.send("Not enough cash to deposit!")
+            return
+
+        cash -= amount
+        bank += amount
+
+        await db.execute("UPDATE users SET cash = ?, bank = ? WHERE user_id = ?", (cash, bank, ctx.author.id))
+        await db.commit()
+        await ctx.send(f"{ctx.author.mention} Deposited {amount} coins to bank.")
+
+# Withdraw command
+@bot.command()
+async def withdraw(ctx, amount: int):
+    if amount <= 0:
+        await ctx.send("You can't withdraw 0 or negative!")
+        return
+
+    async with aiosqlite.connect("casino.db") as db:
+        await ensure_user(db, ctx.author.id)
+        cursor = await db.execute("SELECT cash, bank FROM users WHERE user_id = ?", (ctx.author.id,))
+        cash, bank = await cursor.fetchone()
+
+        if amount > bank:
+            await ctx.send("Not enough coins in bank!")
+            return
+
+        cash += amount
+        bank -= amount
+
+        await db.execute("UPDATE users SET cash = ?, bank = ? WHERE user_id = ?", (cash, bank, ctx.author.id))
+        await db.commit()
+        await ctx.send(f"{ctx.author.mention} Withdrew {amount} coins from bank.")
+
+# Daily reward command (updated for cash)
 @bot.command()
 async def daily(ctx):
     async with aiosqlite.connect("casino.db") as db:
-        cursor = await db.execute("SELECT balance, last_daily FROM users WHERE user_id = ?", (ctx.author.id,))
-        row = await cursor.fetchone()
+        await ensure_user(db, ctx.author.id)
+        cursor = await db.execute("SELECT cash, last_daily FROM users WHERE user_id = ?", (ctx.author.id,))
+        cash, last_daily = await cursor.fetchone()
         today = datetime.utcnow().date().isoformat()
 
-        if row is None:
-            await db.execute("INSERT INTO users (user_id, balance, last_daily) VALUES (?, ?, ?)", (ctx.author.id, 1500, today))
-            await db.commit()
-            await ctx.send(f"{ctx.author.mention} You've received 1500 coins as your first daily reward!")
+        if last_daily == today:
+            await ctx.send(f"{ctx.author.mention} You already claimed your daily reward today!")
         else:
-            balance, last_daily = row
-            if last_daily == today:
-                await ctx.send(f"{ctx.author.mention} You already claimed your daily reward today, try again after 24 Hrs!")
-            else:
-                balance += 500
-                await db.execute("UPDATE users SET balance = ?, last_daily = ? WHERE user_id = ?", (balance, today, ctx.author.id))
-                await db.commit()
-                await ctx.send(f"{ctx.author.mention} You've received 500 coins as your daily reward!")
+            cash += 500
+            await db.execute("UPDATE users SET cash = ?, last_daily = ? WHERE user_id = ?", (cash, today, ctx.author.id))
+            await db.commit()
+            await ctx.send(f"{ctx.author.mention} You received your daily reward of 500 coins!")
 
 # Leaderboard command
 @bot.command()
 async def leaderboard(ctx):
     async with aiosqlite.connect("casino.db") as db:
-        cursor = await db.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 10")
+        cursor = await db.execute("SELECT user_id, cash, bank FROM users")
         rows = await cursor.fetchall()
 
-        if not rows:
-            await ctx.send("Leaderboard is empty!")
-            return
+        leaderboard = sorted(rows, key=lambda x: x[1] + x[2], reverse=True)
+        embed = discord.Embed(title="🏆 Leaderboard", color=discord.Color.brand_green())
 
-        embed = discord.Embed(title="🏆 Casino Leaderboard", color=discord.Color.brand_green())
-        for i, (user_id, balance) in enumerate(rows, start=1):
-            user = await bot.fetch_user(user_id)
-            embed.add_field(name=f"{i}. {user.name}", value=f"{balance} coins", inline=False)
+        for i, row in enumerate(leaderboard[:10], start=1):
+            user = await bot.fetch_user(row[0])
+            total = row[1] + row[2]
+            embed.add_field(name=f"{i}. {user.name}", value=f"Total: {total} coins (Cash: {row[1]}, Bank: {row[2]})", inline=False)
 
         await ctx.send(embed=embed)
 
-# Roulette command
+# Roulette command (only cash used for bets)
 @bot.command()
 async def roulette(ctx, bet: str, amount: int):
     bet = bet.lower()
@@ -98,21 +143,17 @@ async def roulette(ctx, bet: str, amount: int):
         bet_num = None
 
     async with aiosqlite.connect("casino.db") as db:
-        cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (ctx.author.id,))
-        row = await cursor.fetchone()
+        await ensure_user(db, ctx.author.id)
+        cursor = await db.execute("SELECT cash FROM users WHERE user_id = ?", (ctx.author.id,))
+        cash = (await cursor.fetchone())[0]
 
-        if row is None:
-            await ctx.send("You don't have an account yet. Use `!balance` first.")
+        if amount > cash or amount <= 0:
+            await ctx.send("Invalid bet amount!")
             return
 
-        balance = row[0]
-        if amount > balance or amount <= 0:
-            await ctx.send("Invalid bet amount. Check your balance and try again.")
-            return
+        msg = await ctx.send(f"🎰 {ctx.author.display_name} Bet on **{bet.upper()}** with **{amount} coins**\nCountdown: 10 seconds")
 
-        msg = await ctx.send(f"🎰 {ctx.author.display_name} Bet on **{bet.upper()}** with **{amount} coins**\nCountdown: 30 seconds")
-
-        for i in range(29, -1, -1):
+        for i in range(9, -1, -1):
             await asyncio.sleep(1)
             await msg.edit(content=f"🎰 {ctx.author.display_name} Bet on **{bet.upper()}** with **{amount} coins**\nCountdown: {i} seconds")
 
@@ -146,23 +187,19 @@ async def roulette(ctx, bet: str, amount: int):
                 payout = amount * 6
                 win = True
         else:
-            await ctx.send("❌ Invalid bet!\nUsage examples:\n"
-                           "`!roulette red 100`\n"
-                           "`!roulette even 50`\n"
-                           "`!roulette 17 20`\n"
-                           "`!roulette 1-12 30`")
+            await ctx.send("❌ Invalid bet!\nExample: `!roulette red 100`")
             return
 
         if win:
-            balance += payout - amount
+            cash += payout - amount
             await ctx.send(f"🎯 The ball landed on **{result} ({result_color.upper()})**!\n🎉 You won **{payout} coins!**")
         else:
-            balance -= amount
+            cash -= amount
             await ctx.send(f"❌ The ball landed on **{result} ({result_color.upper()})**.\nYou lost **{amount} coins.**")
 
-        await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (balance, ctx.author.id))
+        await db.execute("UPDATE users SET cash = ? WHERE user_id = ?", (cash, ctx.author.id))
         await db.commit()
-        await ctx.send(f"{ctx.author.mention} New balance: **{balance} coins**.")
+        await ctx.send(f"{ctx.author.mention} New cash balance: **{cash} coins**.")
 
 # Run bot
 async def main():
